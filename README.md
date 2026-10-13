@@ -10,7 +10,7 @@ does not contain either vendor's application or CLI binaries.
 ## What it does
 
 - Detects newly saved chats and changes while Chat Transfer is open. The library
-  updates when the app is active and idle, and waits during reviews or transfers.
+  updates in the foreground or background, and waits during reviews or transfers.
   Detection never starts a transfer. Manual refresh remains available with **⌘R**.
 - Searches and filters chats by project, archive status, stars, and selection.
   A details preview shows saved visible user and assistant messages.
@@ -146,7 +146,7 @@ writes, and what to remove from bug reports.
 
 Detection uses native filesystem events, combines rapid changes, and checks saved
 file metadata every 20 seconds as a fallback. Updates are spaced at least three
-seconds apart and catch up when you return to the app. You can pause detection
+seconds apart and catch up after sleep. You can pause detection
 from the app menu.
 
 ## License

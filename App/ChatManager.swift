@@ -731,6 +731,14 @@ private final class WorkspaceModel: ObservableObject {
     private var automaticGeneration: UInt64 = 0
     private var automaticRetryCount = 0
     private var detailGeneration: UInt64 = 0
+    private let automaticManagerHelperURL: URL?
+    private let automaticBridgeHelperURL: URL?
+    private let libraryHelperURL: URL?
+    init(automaticManagerHelperURL:URL?=nil,automaticBridgeHelperURL:URL?=nil,libraryHelperURL:URL?=nil) {
+        self.automaticManagerHelperURL=automaticManagerHelperURL
+        self.automaticBridgeHelperURL=automaticBridgeHelperURL
+        self.libraryHelperURL=libraryHelperURL
+    }
     var isProfileRoute: Bool { source != .claude && destination != .claude }
     var destinations: [BridgeEndpoint] { BridgeEndpoint.allCases.filter { $0 != source && !(source == .claude && $0 == .claude) } }
     var selectionLimit: Int { source != .claude && destination == .claude ? 1 : 50 }
@@ -823,7 +831,7 @@ private final class WorkspaceModel: ObservableObject {
         detailBusy = true; if !preserveCurrent { detail = nil }; detailMessage = "Reading saved messages…"
         defer { if self.focused == focused && source == endpoint && generation == detailGeneration { detailBusy=false } }
         do {
-            let result = try await libraryCall(LibraryRequest(command: "details", source: endpoint.rawValue, id: focused))
+            let result = try await libraryCall(LibraryRequest(command: "details", source: endpoint.rawValue, id: focused),helperURL:libraryHelperURL)
             guard self.focused == focused && source == endpoint && generation == detailGeneration && !Task.isCancelled else { return }
             if result.ok || !preserveCurrent { detail = result.detail }; detailMessage = result.message
         } catch {
@@ -835,8 +843,8 @@ private final class WorkspaceModel: ObservableObject {
         guard !recordsBusy else { return }
         recordsBusy = true; defer { recordsBusy = false }
         do {
-            async let activity = libraryCall(LibraryRequest(command: "activity"))
-            async let recovery = libraryCall(LibraryRequest(command: "backups"))
+            async let activity = libraryCall(LibraryRequest(command: "activity"),helperURL:libraryHelperURL)
+            async let recovery = libraryCall(LibraryRequest(command: "backups"),helperURL:libraryHelperURL)
             let (a,b) = try await (activity,recovery)
             guard !Task.isCancelled else { return }
             if let expectedAutomaticGeneration,expectedAutomaticGeneration != automaticGeneration || !automaticDetectionEnabled { return }
@@ -853,12 +861,12 @@ private final class WorkspaceModel: ObservableObject {
         automaticRetryCount=0
         resumeAutomaticRefresh(manager:manager,bridge:bridge)
     }
-    func automaticChangesAllowed(manager:ChatManagerModel,bridge:BridgeModel,isActive:Bool)->Bool {
-        automaticDetectionEnabled && isActive && !manager.busy && !bridge.busy && !manager.showPreview && !bridge.showPreview
+    func automaticChangesAllowed(manager:ChatManagerModel,bridge:BridgeModel)->Bool {
+        automaticDetectionEnabled && !manager.busy && !bridge.busy && !manager.showPreview && !bridge.showPreview
     }
     func resumeAutomaticRefresh(manager:ChatManagerModel,bridge:BridgeModel) {
         guard automaticDetectionEnabled,!pendingDiscoveryScopes.isEmpty,automaticTask == nil,!automaticUpdating else { return }
-        guard automaticChangesAllowed(manager:manager,bridge:bridge,isActive:NSApplication.shared.isActive) else { return }
+        guard automaticChangesAllowed(manager:manager,bridge:bridge) else { return }
         let interval=min(30.0,3.0 * pow(2.0,Double(automaticRetryCount)))
         let delay=max(0.35,interval-Date().timeIntervalSince(lastAutomaticRefresh))
         let generation=automaticGeneration
@@ -872,7 +880,7 @@ private final class WorkspaceModel: ObservableObject {
             }
             do { try await Task.sleep(for:.seconds(delay)) } catch { return }
             guard !Task.isCancelled,generation == self.automaticGeneration,
-                  self.automaticChangesAllowed(manager:manager,bridge:bridge,isActive:NSApplication.shared.isActive) else { return }
+                  self.automaticChangesAllowed(manager:manager,bridge:bridge) else { return }
             await self.refreshDetectedChanges(manager:manager,bridge:bridge,generation:generation)
         }
     }
@@ -882,16 +890,16 @@ private final class WorkspaceModel: ObservableObject {
         pendingDiscoveryScopes=[];automaticNote="";automaticRetryCount=0
     }
     @discardableResult
-    func applyAutomaticInventory(_ response:ManagerResponse,source expectedSource:BridgeEndpoint,destination expectedDestination:BridgeEndpoint,manager:ChatManagerModel,bridge:BridgeModel,isActive:Bool)->Bool {
+    func applyAutomaticInventory(_ response:ManagerResponse,source expectedSource:BridgeEndpoint,destination expectedDestination:BridgeEndpoint,manager:ChatManagerModel,bridge:BridgeModel)->Bool {
         guard response.ok,source == expectedSource,destination == expectedDestination,
-              automaticChangesAllowed(manager:manager,bridge:bridge,isActive:isActive) else { return false }
+              automaticChangesAllowed(manager:manager,bridge:bridge) else { return false }
         manager.chats=response.chats;manager.inventoryLoaded=true
         selected.formIntersection(Set(response.chats.map(\.id)))
         if let focused,!response.chats.contains(where:{ $0.id == focused }) { self.focused=nil;detail=nil;detailBusy=false;detailGeneration += 1 }
         return true
     }
     private func refreshDetectedChanges(manager:ChatManagerModel,bridge:BridgeModel,generation:UInt64) async {
-        let scopes=pendingDiscoveryScopes
+        var scopes=pendingDiscoveryScopes
         pendingDiscoveryScopes=[]
         let expectedSource=source,expectedDestination=destination
         let sourceScope=DiscoveryScope(rawValue:source.rawValue)
@@ -899,20 +907,31 @@ private final class WorkspaceModel: ObservableObject {
         let inventoryChanged=scopes.contains(where:{ $0 == sourceScope || $0 == targetScope })
         automaticUpdating=true;lastAutomaticRefresh=Date()
         defer { automaticUpdating=false }
+        // Activity and backups are independent of the selected profile route.
+        // An unavailable inventory must not prevent their saved records updating.
+        if scopes.remove(.records) != nil {
+            if recordsBusy { pendingDiscoveryScopes.insert(.records) }
+            else { await loadRecords(expectedAutomaticGeneration:generation) }
+        }
+        guard !Task.isCancelled,generation == automaticGeneration,
+              automaticChangesAllowed(manager:manager,bridge:bridge) else {
+            if !Task.isCancelled,generation == automaticGeneration { pendingDiscoveryScopes.formUnion(scopes) }
+            return
+        }
         if inventoryChanged {
             do {
                 if expectedSource == .claude {
-                    let result=try await bridgeCall(BridgeRequest(command:"bridge_list",source:expectedSource,destination:expectedDestination,ids:[],selection_token:nil))
+                    let result=try await bridgeCall(BridgeRequest(command:"bridge_list",source:expectedSource,destination:expectedDestination,ids:[],selection_token:nil),helperURL:automaticBridgeHelperURL)
                     guard result.ok,source == expectedSource,destination == expectedDestination,
-                          automaticChangesAllowed(manager:manager,bridge:bridge,isActive:NSApplication.shared.isActive),!Task.isCancelled,generation == automaticGeneration else {
+                          automaticChangesAllowed(manager:manager,bridge:bridge),!Task.isCancelled,generation == automaticGeneration else {
                         if !Task.isCancelled,generation == automaticGeneration { pendingDiscoveryScopes.formUnion(scopes);automaticRetryCount=min(4,automaticRetryCount+1);automaticNote="Updates are waiting. Saved chats stay available." };return
                     }
                     bridge.chats=result.chats ?? [];bridge.inventoryLoaded=true
                     selected.formIntersection(Set(bridge.chats.map(\.id)))
                     if let focused,!bridge.chats.contains(where:{ $0.id == focused }) { self.focused=nil;detail=nil;detailBusy=false;detailGeneration += 1 }
                 } else if let profile=expectedSource.profile {
-                    let result=try await managerCall(ManagerRequest(command:"list",operation:nil,source:profile,ids:[],destination:expectedDestination.profile ?? profile.other))
-                    guard !Task.isCancelled,generation == automaticGeneration,applyAutomaticInventory(result,source:expectedSource,destination:expectedDestination,manager:manager,bridge:bridge,isActive:NSApplication.shared.isActive) else {
+                    let result=try await managerCall(ManagerRequest(command:"list",operation:nil,source:profile,ids:[],destination:expectedDestination.profile ?? profile.other),helperURL:automaticManagerHelperURL)
+                    guard !Task.isCancelled,generation == automaticGeneration,applyAutomaticInventory(result,source:expectedSource,destination:expectedDestination,manager:manager,bridge:bridge) else {
                         if !Task.isCancelled,generation == automaticGeneration { pendingDiscoveryScopes.formUnion(scopes);automaticRetryCount=min(4,automaticRetryCount+1);automaticNote="Updates are waiting. Saved chats stay available." };return
                     }
                 }
@@ -924,11 +943,6 @@ private final class WorkspaceModel: ObservableObject {
             } catch {
                 if !Task.isCancelled,generation == automaticGeneration { pendingDiscoveryScopes.formUnion(scopes);automaticRetryCount=min(4,automaticRetryCount+1);automaticNote="Updates are delayed; detection will retry." }
             }
-        }
-        guard !Task.isCancelled,generation == automaticGeneration else { return }
-        if scopes.contains(.records) {
-            if recordsBusy { pendingDiscoveryScopes.insert(.records) }
-            else { await loadRecords(expectedAutomaticGeneration:generation) }
         }
     }
 
@@ -1594,25 +1608,122 @@ private struct ManagerProtocolTests {
             liveWorkspace.source = .chatgpt;liveWorkspace.destination = .arbeit
             liveWorkspace.query="First";liveWorkspace.project="project-filter";liveWorkspace.selected=["one"]
             let liveManager=ChatManagerModel(),liveBridge=BridgeModel()
-            try check(liveWorkspace.automaticChangesAllowed(manager:liveManager,bridge:liveBridge,isActive:true))
-            try check(!liveWorkspace.automaticChangesAllowed(manager:liveManager,bridge:liveBridge,isActive:false))
-            try check(liveWorkspace.applyAutomaticInventory(list,source:.chatgpt,destination:.arbeit,manager:liveManager,bridge:liveBridge,isActive:true))
+            try check(liveWorkspace.automaticChangesAllowed(manager:liveManager,bridge:liveBridge))
+            try check(!NSApplication.shared.isActive)
+            try check(liveWorkspace.applyAutomaticInventory(list,source:.chatgpt,destination:.arbeit,manager:liveManager,bridge:liveBridge))
             try check(liveManager.chats.count == 2 && liveWorkspace.selected == ["one"])
             try check(liveWorkspace.query == "First" && liveWorkspace.project == "project-filter")
             liveManager.showPreview=true
-            try check(!liveWorkspace.automaticChangesAllowed(manager:liveManager,bridge:liveBridge,isActive:true))
-            try check(!liveWorkspace.applyAutomaticInventory(list,source:.chatgpt,destination:.arbeit,manager:liveManager,bridge:liveBridge,isActive:true))
+            try check(!liveWorkspace.automaticChangesAllowed(manager:liveManager,bridge:liveBridge))
+            try check(!liveWorkspace.applyAutomaticInventory(list,source:.chatgpt,destination:.arbeit,manager:liveManager,bridge:liveBridge))
             liveManager.showPreview=false;liveBridge.showPreview=true
-            try check(!liveWorkspace.automaticChangesAllowed(manager:liveManager,bridge:liveBridge,isActive:true))
+            try check(!liveWorkspace.automaticChangesAllowed(manager:liveManager,bridge:liveBridge))
             liveBridge.showPreview=false;liveManager.busy=true
-            try check(!liveWorkspace.automaticChangesAllowed(manager:liveManager,bridge:liveBridge,isActive:true))
+            try check(!liveWorkspace.automaticChangesAllowed(manager:liveManager,bridge:liveBridge))
             liveManager.busy=false
-            try check(!liveWorkspace.applyAutomaticInventory(list,source:.personal,destination:.arbeit,manager:liveManager,bridge:liveBridge,isActive:true))
-            try check(!liveWorkspace.applyAutomaticInventory(list,source:.chatgpt,destination:.personal,manager:liveManager,bridge:liveBridge,isActive:true))
+            try check(!liveWorkspace.applyAutomaticInventory(list,source:.personal,destination:.arbeit,manager:liveManager,bridge:liveBridge))
+            try check(!liveWorkspace.applyAutomaticInventory(list,source:.chatgpt,destination:.personal,manager:liveManager,bridge:liveBridge))
             liveWorkspace.automaticDetectionEnabled=false
-            try check(!liveWorkspace.automaticChangesAllowed(manager:liveManager,bridge:liveBridge,isActive:true))
+            try check(!liveWorkspace.automaticChangesAllowed(manager:liveManager,bridge:liveBridge))
             try check(liveWorkspace.selected == ["one"] && liveManager.chats.count == 2)
-            print("{\"passed\":\(checks),\"mock_backend_calls\":9,\"app_operations\":0,\"profile_writes\":0}")
+            func waitUntil(_ condition: @MainActor ()->Bool) async throws {
+                let deadline=Date().addingTimeInterval(10)
+                while !condition() {
+                    guard Date() < deadline else { throw ManagerFailure(message:"Automatic update did not arrive.") }
+                    try await Task.sleep(for:.milliseconds(25))
+                }
+            }
+            let automaticMock=temporary.appendingPathComponent("automatic-manager.py")
+            let automaticData=automaticMock.deletingPathExtension().appendingPathExtension("json")
+            let automaticLibrary=temporary.appendingPathComponent("automatic-library.py")
+            let automaticLibraryData=automaticLibrary.deletingPathExtension().appendingPathExtension("json")
+            let automaticTrace=temporary.appendingPathComponent("automatic-calls.txt")
+            let automaticProgram="""
+                import json,sys
+                from pathlib import Path
+                request=json.load(sys.stdin)
+                here=Path(__file__)
+                command=request['command']
+                if here.name=='automatic-manager.py':
+                    assert command=='list' and request['ids']==[]
+                    assert request['source']=='chatgpt' and request['destination']=='arbeit'
+                    assert 'operation' not in request and 'selection_token' not in request
+                else:
+                    assert command in ('activity','backups','details')
+                    if command=='details': assert request['source']=='chatgpt' and request['id']=='one'
+                with (here.parent/'automatic-calls.txt').open('a') as log: log.write(command+'\\n')
+                response=json.loads(here.with_suffix('.json').read_text())
+                print(json.dumps(response if command=='list' else response[command]))
+                """
+            try Data(automaticProgram.utf8).write(to:automaticMock)
+            try Data(automaticProgram.utf8).write(to:automaticLibrary)
+            func saveAutomaticData(_ title:String,_ text:String,includeNewChat:Bool=true,ok:Bool=true) throws {
+                var fixtureRows:[[String:Any]]=[["id":"one","title":title,"cwd":"project-filter","updated_at":125]]
+                if includeNewChat { fixtureRows.append(["id":"new","title":"New saved chat","cwd":"project-filter","updated_at":126]) }
+                let inventory:[String:Any]=["ok":ok,"message":ok ? "Read only fixture":"Unavailable fixture profile","chats":fixtureRows]
+                let details:[String:Any]=["ok":true,"message":"Read only fixture","detail":["id":"one","source":"chatgpt","title":title,"messages":[["role":"assistant","text":text]]]]
+                let records:[String:Any]=["ok":true,"message":"Read only fixture","activities":[["id":"automatic-record","created_at":127,"source":"chatgpt","destination":"arbeit","action":"copy","title":"Synthetic activity fixture","status":"completed","message":"Synthetic metadata only","items":[],"paths":[]]]]
+                let responses:[String:Any]=["details":details,"activity":records,"backups":["ok":true,"message":"Read only fixture","backups":[]]]
+                try JSONSerialization.data(withJSONObject:inventory).write(to:automaticData,options:.atomic)
+                try JSONSerialization.data(withJSONObject:responses).write(to:automaticLibraryData,options:.atomic)
+            }
+            let automaticWorkspace=WorkspaceModel(automaticManagerHelperURL:automaticMock,libraryHelperURL:automaticLibrary)
+            let automaticManager=ChatManagerModel(),automaticBridge=BridgeModel()
+            automaticWorkspace.automaticDetectionEnabled=true
+            automaticWorkspace.query="saved";automaticWorkspace.project="project-filter";automaticWorkspace.selected=["one"]
+            automaticWorkspace.focused="one";automaticManager.chats=Array(list.chats.prefix(1))
+            defer { automaticWorkspace.stopAutomaticRefresh() }
+            try saveAutomaticData("First saved chat","First saved reply")
+            try check(!NSApplication.shared.isActive)
+            automaticWorkspace.requestAutomaticRefresh([.chatgpt],manager:automaticManager,bridge:automaticBridge)
+            try await waitUntil { automaticManager.chats.contains(where:{ $0.id == "new" }) && automaticWorkspace.detail?.messages.first?.text == "First saved reply" && !automaticWorkspace.automaticUpdating }
+            try check(automaticManager.chats.count == 2 && automaticManager.inventoryLoaded)
+            try check(automaticWorkspace.selected == ["one"] && automaticWorkspace.focused == "one")
+            try check(automaticWorkspace.query == "saved" && automaticWorkspace.project == "project-filter")
+            try saveAutomaticData("Edited saved chat","Updated saved reply")
+            automaticWorkspace.requestAutomaticRefresh([.chatgpt],manager:automaticManager,bridge:automaticBridge)
+            try await waitUntil { automaticManager.chats.first(where:{ $0.id == "one" })?.title == "Edited saved chat" && automaticWorkspace.detail?.messages.first?.text == "Updated saved reply" && !automaticWorkspace.automaticUpdating }
+            try check(automaticWorkspace.selected == ["one"] && automaticWorkspace.query == "saved" && automaticWorkspace.project == "project-filter")
+            try check(!automaticManager.busy && !automaticBridge.busy && !automaticManager.showPreview && !automaticBridge.showPreview)
+            automaticWorkspace.stopAutomaticRefresh()
+
+            let mixedWorkspace=WorkspaceModel(automaticManagerHelperURL:automaticMock,libraryHelperURL:automaticLibrary)
+            let mixedManager=ChatManagerModel(),mixedBridge=BridgeModel()
+            mixedWorkspace.automaticDetectionEnabled=true
+            defer { mixedWorkspace.stopAutomaticRefresh() }
+            try saveAutomaticData("Unavailable saved chat","Saved reply",ok:false)
+            try Data().write(to:automaticTrace)
+            mixedWorkspace.requestAutomaticRefresh([.chatgpt,.records],manager:mixedManager,bridge:mixedBridge)
+            try await waitUntil { mixedWorkspace.activities.first?.id == "automatic-record" && !mixedWorkspace.automaticUpdating && !mixedWorkspace.automaticNote.isEmpty }
+            try check(mixedWorkspace.activities.count == 1 && mixedManager.chats.isEmpty)
+            try check(mixedWorkspace.recordsMessage.isEmpty)
+            try await waitUntil { ((try? String(contentsOf:automaticTrace,encoding:.utf8)) ?? "").split(separator:"\n").filter { $0 == "list" }.count >= 2 && !mixedWorkspace.automaticUpdating }
+            let mixedCalls=try String(contentsOf:automaticTrace,encoding:.utf8).split(separator:"\n")
+            try check(mixedCalls.filter { $0 == "activity" }.count == 1 && mixedCalls.filter { $0 == "backups" }.count == 1)
+            mixedWorkspace.stopAutomaticRefresh()
+
+            let delayedMock=temporary.appendingPathComponent("delayed-manager.py")
+            let delayedStarted=temporary.appendingPathComponent("delayed-started.txt")
+            try Data("""
+                import json,sys,time
+                from pathlib import Path
+                request=json.load(sys.stdin)
+                assert request['command']=='list' and request['ids']==[]
+                Path(__file__).with_name('delayed-started.txt').write_text('started')
+                time.sleep(0.35)
+                print(json.dumps({'ok':True,'message':'Read only fixture','chats':[{'id':'stale','title':'Stale fixture'}]}))
+                """.utf8).write(to:delayedMock)
+            let cancelledWorkspace=WorkspaceModel(automaticManagerHelperURL:delayedMock)
+            let cancelledManager=ChatManagerModel(),cancelledBridge=BridgeModel()
+            cancelledWorkspace.automaticDetectionEnabled=true
+            defer { cancelledWorkspace.stopAutomaticRefresh() }
+            cancelledWorkspace.requestAutomaticRefresh([.chatgpt],manager:cancelledManager,bridge:cancelledBridge)
+            try await waitUntil { FileManager.default.fileExists(atPath:delayedStarted.path) }
+            cancelledWorkspace.stopAutomaticRefresh()
+            try await waitUntil { !cancelledWorkspace.automaticUpdating }
+            try check(cancelledManager.chats.isEmpty && !cancelledManager.inventoryLoaded)
+            try check(cancelledWorkspace.automaticNote.isEmpty)
+            print("{\"passed\":\(checks),\"mock_backend_calls\":\(9+4+mixedCalls.count+1),\"app_operations\":0,\"profile_writes\":0}")
         } catch {
             fputs("Chat Manager protocol tests failed.\n", stderr)
             exit(1)

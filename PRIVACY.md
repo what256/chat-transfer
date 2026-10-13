@@ -22,8 +22,8 @@ paths, timestamps, archive status, and saved visible user/assistant text. These
 values can contain personal information.
 
 Automatic discovery observes local saved-history changes while the app is open.
-It updates the library when active and idle, defers during reviews or transfers,
-and catches up when you return. It does not upload detected information, perform a
+It updates the library in the foreground or background, defers during reviews or
+transfers, and catches up after sleep. It does not upload detected information, perform a
 transfer, change profiles, start a model turn, or enable an app-switch sync service.
 
 For a reviewed transfer, the app examines the selected chats and their necessary
