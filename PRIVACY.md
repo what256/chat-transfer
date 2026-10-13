@@ -12,7 +12,7 @@ Tests contain only synthetic identifiers and conversation examples.
 
 `PUBLIC_FILES.txt` is the release allowlist. `.gitignore` defaults to excluding
 files unless explicitly allowlisted. Do not use `git add -f` to include runtime
-data. Build products and test output stay under the ignored `build/` directory.
+data. Build products and test output stay under the ignored `build.noindex/` directory.
 
 ## What the app reads
 

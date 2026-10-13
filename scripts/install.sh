@@ -4,7 +4,7 @@ set -euo pipefail
 umask 077
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
-APP="$ROOT/build/Chat Transfer.app"
+APP="$ROOT/build.noindex/Chat Transfer.app"
 DESTINATION="$HOME/Applications/Chat Transfer.app"
 CONTROL="$HOME/Library/Application Support/Arbeit/chat-manager"
 MAINTENANCE="$HOME/Library/Application Support/Arbeit/maintenance-backups"
@@ -22,6 +22,25 @@ fi
 if [[ "$(uname -s)" != Darwin ]]; then
     echo "Chat Transfer requires macOS." >&2
     exit 1
+fi
+if [[ $# -eq 0 ]]; then
+    INSTALLATIONS=()
+    for candidate in "/Applications/Chat Transfer.app" "/Applications/Chat Manager.app" \
+        "$HOME/Applications/Chat Transfer.app" "$HOME/Applications/Chat Manager.app"; do
+        if [[ -d "$candidate" && ! -L "$candidate" ]]; then
+            candidate_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$candidate/Contents/Info.plist" 2>/dev/null || true)"
+            if [[ "$candidate_id" == "$BUNDLE_ID" ]]; then
+                INSTALLATIONS+=("$candidate")
+            fi
+        fi
+    done
+    if [[ ${#INSTALLATIONS[@]} -gt 1 ]]; then
+        echo 'Multiple Chat Transfer installations found. Use --destination to choose one.' >&2
+        printf '  %s\n' "${INSTALLATIONS[@]}" >&2
+        exit 1
+    elif [[ ${#INSTALLATIONS[@]} -eq 1 ]]; then
+        DESTINATION="${INSTALLATIONS[0]}"
+    fi
 fi
 if [[ "$DESTINATION" != /* || "$DESTINATION" != *.app || "$DESTINATION" == *'/../'* ]]; then
     echo "Choose an absolute .app destination path without parent traversal." >&2

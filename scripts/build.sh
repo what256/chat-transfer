@@ -4,7 +4,7 @@ set -euo pipefail
 umask 077
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
-BUILD="$ROOT/build"
+BUILD="$ROOT/build.noindex"
 APP="$BUILD/Chat Transfer.app"
 HELPERS=(manager.py bridge.py library.py handoff.py auto_sync.py)
 SWIFT_SOURCES=()

@@ -4,7 +4,7 @@ set -euo pipefail
 umask 077
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
-BUILD="$ROOT/build"
+BUILD="$ROOT/build.noindex"
 SWIFT_SOURCES=()
 if [[ "$(uname -s)" != Darwin || "$(uname -m)" != arm64 ]]; then
     echo "The complete test suite requires macOS on Apple silicon." >&2

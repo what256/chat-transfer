@@ -77,7 +77,7 @@ settings UI yet.
 ./scripts/build.sh
 ```
 
-This creates `build/Chat Transfer.app` and includes only the five Python helper
+This creates `build.noindex/Chat Transfer.app` and includes only the five Python helper
 source files needed at runtime. It compiles the app and monochrome icon locally,
 then applies an ad-hoc signature. The build does not read chats, install files,
 change vendor apps, or open model sessions. It is not a notarized distribution.
@@ -108,8 +108,10 @@ Quit Chat Transfer first, then run:
 ./scripts/install.sh
 ```
 
-The default app location is `~/Applications/Chat Transfer.app`. Choose another
-location explicitly if needed:
+The installer updates an existing Chat Transfer installation when exactly one is
+found in `/Applications` or `~/Applications`, including the former `Chat Manager`
+filename. A new installation defaults to `~/Applications/Chat Transfer.app`.
+If several installations exist, choose one explicitly:
 
 ```sh
 ./scripts/install.sh --destination "/absolute/path/Chat Transfer.app"
@@ -121,6 +123,9 @@ existing local activity and backups, those helpers are installed under
 previous Chat Transfer app at the chosen destination are backed up before
 replacement. Other files in that runtime directory are kept. Vendor apps, profiles,
 authentication, settings, and chat data are not copied by the installer.
+
+Build products stay in `build.noindex/` so Spotlight does not list them as another
+installed app.
 
 The app's bundle identifier is `local.chatgpt.chat-manager`. The installer refuses
 to replace another app, refuses redirected paths, and requires Chat Transfer to
