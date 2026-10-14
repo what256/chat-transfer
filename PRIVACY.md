@@ -67,11 +67,16 @@ separate Codex, ChatGPT, and Claude applications/CLIs have their own account,
 network, permissions, and privacy behavior. Opening a continuation or destination
 does not change those products' policies.
 
-Preparing a Claude continuation writes a transcript and launcher locally. Opening
-the launcher creates an interactive Claude Code session that waits for the user's
-next message. When the user works in that CLI, conversation context may be sent
-according to their selected provider and its normal behavior. A continuation is
-not an offline guarantee for the destination application.
+Preparing a Claude continuation writes local context files. Opening Claude Desktop
+uses its Code composer link with a short unsent draft referencing the complete
+local transcript. The link contains file and project paths, but no transcript text
+or source chat ID. Desktop asks the user to confirm the project folder. Chat
+Transfer does not press Send or fabricate Desktop conversation records.
+
+When the user sends the draft or works in Claude Code, conversation context may be
+read and sent according to that product's selected provider and normal behavior.
+The optional legacy terminal launcher remains available in older saved packages.
+A continuation is not an offline guarantee for the destination application.
 
 ## Safe issue reports
 

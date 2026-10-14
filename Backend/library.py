@@ -307,6 +307,8 @@ class Library:
             return self.backups()
         if command == "details":
             return self.details(request)
+        if command == "desktop_continuation":
+            return bridge.desktop_continuation(self.control / "bridge", request.get("output_directory"))
         raise bridge.BridgeError("Choose a supported library view.")
 
 

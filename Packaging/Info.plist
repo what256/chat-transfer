@@ -8,8 +8,8 @@
     <key>CFBundleExecutable</key><string>ChatManager</string>
     <key>CFBundleIdentifier</key><string>local.chatgpt.chat-manager</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>3.3.1</string>
-    <key>CFBundleVersion</key><string>34</string>
+    <key>CFBundleShortVersionString</key><string>3.3.2</string>
+    <key>CFBundleVersion</key><string>35</string>
     <key>CFBundleIconFile</key><string>ChatManager</string>
     <key>LSMinimumSystemVersion</key><string>13.0</string>
     <key>NSHighResolutionCapable</key><true/>

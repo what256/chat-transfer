@@ -405,6 +405,7 @@ private enum BridgeEndpoint: String, Codable, CaseIterable, Identifiable, Sendab
         case .personal: "Personal"
         }
     }
+    var destinationTitle: String { self == .claude ? "Claude Desktop · Code" : title }
     var symbol: String { self == .claude ? "terminal" : "sparkle" }
     var color: Color { .primary }
 }
@@ -579,10 +580,16 @@ private final class BridgeModel: ObservableObject {
         guard let directory = response?.output_directory, let url = privateOutputURL(directory) else { return }
         NSWorkspace.shared.activateFileViewerSelecting([url])
     }
-    func openClaudeCode() {
-        guard finished, let path = response?.launch_file, path.hasSuffix(".command"),
-              let url = privateOutputURL(path) else { return }
-        if !NSWorkspace.shared.open(url) { message = "Could not open the Claude Code launcher. Use Show files to open it in Terminal." }
+    func openClaudeDesktop() async {
+        guard finished,!busy,let directory=response?.output_directory else { return }
+        busy=true;stage="Opening Claude Desktop"
+        defer { busy=false }
+        do {
+            let context=try await libraryCall(LibraryRequest(command:"desktop_continuation",output_directory:directory))
+            try await showClaudeDesktop(context)
+            message="Opened the Code composer. Confirm the project folder, review the prompt, then send when ready."
+            showPreview=false
+        } catch { message=(error as? ManagerFailure)?.message ?? "Claude Desktop could not open Code. Your saved context remains available." }
     }
     func openDestination() {
         guard finished, destination != .claude else { return }
@@ -671,11 +678,50 @@ private struct LibraryResponse: Decodable, Sendable {
     var detail: SessionDetail?
     var activities: [ActivityRecord]?
     var backups: [BackupRecord]?
+    var desktop_url: String?
+    var output_directory: String?
+    var transcript_file: String?
+    var project_path: String?
 }
 private struct LibraryRequest: Encodable, Sendable {
     var command: String
     var source: String? = nil
     var id: String? = nil
+    var output_directory: String? = nil
+}
+private func claudeDesktopComposerURL(_ value:String)->URL? {
+    guard value.utf8.count <= 32768,let components=URLComponents(string:value),
+          components.scheme == "claude",components.host == "code",components.path == "/new",
+          components.user == nil,components.password == nil,components.port == nil,components.fragment == nil,
+          let items=components.queryItems,items.count == 2,
+          items.filter({ $0.name == "q" }).count == 1,items.filter({ $0.name == "folder" }).count == 1,
+          let prompt=items.first(where:{ $0.name == "q" })?.value,!prompt.isEmpty,prompt.count <= 4096,
+          let folder=items.first(where:{ $0.name == "folder" })?.value,folder.hasPrefix("/") else { return nil }
+    var directory:ObjCBool=false
+    guard FileManager.default.fileExists(atPath:folder,isDirectory:&directory),directory.boolValue else { return nil }
+    return components.url
+}
+@MainActor
+private func showClaudeDesktop(_ response:LibraryResponse) async throws {
+    guard response.ok else { throw ManagerFailure(message:response.message) }
+    guard let value=response.desktop_url,let url=claudeDesktopComposerURL(value) else {
+        throw ManagerFailure(message:"The saved context could not produce a valid Claude Desktop link.")
+    }
+    let home=FileManager.default.homeDirectoryForCurrentUser
+    let candidates=[URL(fileURLWithPath:"/Applications/Claude.app"),home.appendingPathComponent("Applications/Claude.app")]
+    guard let app=candidates.first(where:{ Bundle(url:$0)?.bundleIdentifier == "com.anthropic.claudefordesktop" }) else {
+        throw ManagerFailure(message:"Install Claude Desktop to open this context in its Code section.")
+    }
+    let configuration=NSWorkspace.OpenConfiguration()
+    configuration.allowsRunningApplicationSubstitution=false
+    configuration.createsNewApplicationInstance=false
+    configuration.activates=true
+    let opened:Bool=await withCheckedContinuation { continuation in
+        NSWorkspace.shared.open([url],withApplicationAt:app,configuration:configuration) { _,error in
+            continuation.resume(returning:error == nil)
+        }
+    }
+    if !opened { throw ManagerFailure(message:"Claude Desktop could not open Code. Your saved context remains available.") }
 }
 private func libraryCall(_ request: LibraryRequest, helperURL: URL? = nil) async throws -> LibraryResponse {
     let body = try JSONEncoder().encode(request)
@@ -720,6 +766,7 @@ private final class WorkspaceModel: ObservableObject {
     @Published var backups: [BackupRecord] = []
     @Published var recordsBusy = false
     @Published var recordsMessage = ""
+    @Published var desktopOpening = false
     @Published var starred: Set<String> = Set(UserDefaults.standard.stringArray(forKey: "StarredChats") ?? [])
     @Published var notice = ""
     @Published var automaticDetectionEnabled = UserDefaults.standard.object(forKey:"AutomaticChatDetection") as? Bool ?? true
@@ -745,11 +792,11 @@ private final class WorkspaceModel: ObservableObject {
     var fidelity: String { isProfileRoute ? "Saved history" : (source == .claude ? "Native import" : "Saved context") }
     var routeNote: String {
         if isProfileRoute { return action == .move ? "Verified history arrives in the destination. The source chat moves to its archive." : (action == .sync ? "Updates the side with older history when a verified baseline supports it. Conflicts stay available for review." : "Copies saved messages and recorded tool history. Your source stays available.") }
-        return source == .claude ? "Imports the selected Claude Code sessions into Codex. Source sessions stay available." : "Creates a new Claude Code session with saved user and assistant messages as reference context."
+        return source == .claude ? "Imports the selected Claude Code sessions into Codex. Source sessions stay available." : "Prepares saved user and assistant messages for a new conversation in Claude Desktop’s Code section."
     }
     var routeFootnote: String {
         if isProfileRoute { return "Private backups are kept. Open apps may need to reload when idle." }
-        return source == .claude ? "Credentials, settings and connections stay separate." : "Live tools, hidden reasoning and checkpoints stay in Codex. Preparing sends no model turn."
+        return source == .claude ? "Credentials, settings and connections stay separate." : "Open the Desktop composer, confirm the project folder, then send when ready. The original timeline and tools stay in Codex."
     }
     func sessions(_ manager: ChatManagerModel, _ bridge: BridgeModel) -> [LibrarySession] {
         if source == .claude {
@@ -952,6 +999,16 @@ private final class WorkspaceModel: ObservableObject {
         let url = URL(fileURLWithPath: path).standardizedFileURL
         guard url.path == url.resolvingSymlinksInPath().path, roots.contains(where: { url.path.hasPrefix($0) }), FileManager.default.fileExists(atPath: url.path) else { notice = "This saved file is no longer available."; return }
         NSWorkspace.shared.activateFileViewerSelecting([url])
+    }
+    func openSavedClaudeDesktop(_ directory:String) async {
+        guard !desktopOpening else { return }
+        desktopOpening=true
+        defer { desktopOpening=false }
+        do {
+            let response=try await libraryCall(LibraryRequest(command:"desktop_continuation",output_directory:directory),helperURL:libraryHelperURL)
+            try await showClaudeDesktop(response)
+            recordsMessage="Opened Claude Desktop’s Code composer. Confirm the folder and send when ready. The conversation appears in Desktop after its first message."
+        } catch { recordsMessage=(error as? ManagerFailure)?.message ?? "Claude Desktop could not open Code. Your saved context remains available." }
     }
 }
 
@@ -1198,7 +1255,7 @@ private struct ChatManagerView: View {
             .contextMenu { Button(workspace.isStarred(row.id) ? "Remove star" : "Star chat") { workspace.star(row.id) };Button(workspace.selected.contains(row.id) ? "Remove from transfer" : "Add to transfer") { workspace.toggle(row.id) };if let cwd=row.cwd { Button("Show project folder") { NSWorkspace.shared.selectFile(nil,inFileViewerRootedAtPath:cwd) } } }
     }
     private var shortRouteNote: String {
-        if !workspace.isProfileRoute { return workspace.source == .claude ? "Import saved sessions. Originals stay available." : "A new Claude Code session with saved text as context." }
+        if !workspace.isProfileRoute { return workspace.source == .claude ? "Import saved sessions. Originals stay available." : "Saved context for Claude Desktop’s Code composer." }
         switch workspace.action { case .copy:return "The source stays available.";case .move:return "Archives the source after verification.";case .sync:return "Reconciles saved history; conflicts need review." }
     }
     private var inspector: some View {
@@ -1206,7 +1263,7 @@ private struct ChatManagerView: View {
             ScrollView {
                 VStack(alignment:.leading,spacing:13) {
                     Text("Transfer to").font(.system(size:13,weight:.medium))
-                    Picker("Destination",selection:$workspace.destination) { ForEach(workspace.destinations) { endpoint in Label(endpoint.title,systemImage:endpoint.icon).tag(endpoint) } }.labelsHidden().controlSize(.regular).disabled(busy).accessibilityLabel("Transfer destination")
+                    Picker("Destination",selection:$workspace.destination) { ForEach(workspace.destinations) { endpoint in Label(endpoint.destinationTitle,systemImage:endpoint == .claude ? "laptopcomputer" : endpoint.icon).tag(endpoint) } }.labelsHidden().controlSize(.regular).disabled(busy).accessibilityLabel("Transfer destination")
                     if workspace.isProfileRoute { Picker("Transfer action",selection:$workspace.action) { Text("Copy").tag(ChatAction.copy);Text("Move").tag(ChatAction.move);Text("Sync").tag(ChatAction.sync) }.pickerStyle(.segmented).labelsHidden().disabled(busy) }
                     Text(shortRouteNote).font(.system(size:11)).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true).lineSpacing(2)
                     if !selectedRows.isEmpty {
@@ -1285,11 +1342,14 @@ private struct ChatManagerView: View {
     }
     private func activityRow(_ record:ActivityRecord)->some View {
         VStack(alignment:.leading,spacing:10) {
-            HStack { Text(record.title).font(.system(size:13,weight:.medium));Spacer();Label(record.status.capitalized,systemImage:record.status == "completed" ? "checkmark.circle" : "exclamationmark.circle").font(.system(size:10)).foregroundStyle(.secondary) }
-            HStack(spacing:8) { Text(BridgeEndpoint(rawValue:record.source)?.title ?? record.source);Image(systemName:"arrow.right");Text(BridgeEndpoint(rawValue:record.destination)?.title ?? record.destination);Spacer();Text(Date(timeIntervalSince1970:record.created_at),format:.dateTime.month(.abbreviated).day().hour().minute()) }.font(.system(size:11)).foregroundStyle(.secondary)
-            Text(record.message).font(.system(size:11)).textSelection(.enabled)
+            HStack { Text(record.title).font(.system(size:13,weight:.medium));Spacer();Label(record.destination == "claude" && record.action == "continue" && record.status == "completed" ? "Context ready" : record.status.capitalized,systemImage:record.status == "completed" ? "checkmark.circle" : "exclamationmark.circle").font(.system(size:10)).foregroundStyle(.secondary) }
+            HStack(spacing:8) { Text(BridgeEndpoint(rawValue:record.source)?.title ?? record.source);Image(systemName:"arrow.right");Text(BridgeEndpoint(rawValue:record.destination)?.destinationTitle ?? record.destination);Spacer();Text(Date(timeIntervalSince1970:record.created_at),format:.dateTime.month(.abbreviated).day().hour().minute()) }.font(.system(size:11)).foregroundStyle(.secondary)
+            Text(record.destination == "claude" && record.action == "continue" && record.status == "completed" ? "Saved context is ready. Open Claude Desktop’s Code composer, confirm the folder, and send your next message to create its conversation." : record.message).font(.system(size:11)).textSelection(.enabled)
             ForEach(record.items) { item in HStack(spacing:7) { Image(systemName:item.verified ? "checkmark.circle" : "circle.dashed");Text(item.title);Spacer();Text(item.status.capitalized) }.font(.system(size:11)).foregroundStyle(.secondary) }
             if !record.paths.isEmpty { HStack { ForEach(Array(record.paths.prefix(3).enumerated()),id:\.offset) { index,path in Button(index == 0 ? "Show saved files" : "Show backup \(index)") { workspace.reveal(path) }.controlSize(.small) } } }
+            if record.destination == "claude",record.action == "continue",record.status == "completed",let directory=record.paths.first {
+                Button(workspace.desktopOpening ? "Opening Claude Desktop…" : "Open Claude Desktop") { Task { await workspace.openSavedClaudeDesktop(directory) } }.controlSize(.small).disabled(workspace.desktopOpening)
+            }
             if record.status != "completed" { Button("Review again") { if let source=BridgeEndpoint(rawValue:record.source),let destination=BridgeEndpoint(rawValue:record.destination) { Task { await workspace.changeSource(source,manager:model,bridge:bridge);workspace.destination=destination;if let action=ChatAction(rawValue:record.action) { workspace.action=action };workspace.selected=Set(record.items.map(\.id));workspace.notice="Review current histories before retrying." } } }.controlSize(.small) }
         }.padding(.vertical,18).frame(maxWidth:.infinity,alignment:.leading)
     }
@@ -1320,16 +1380,16 @@ private struct BridgePreview: View {
                 }
             }.frame(maxHeight:300)
             Text(model.message).font(.callout).textSelection(.enabled).fixedSize(horizontal:false,vertical:true)
-            if model.finished, model.response?.launch_file != nil {
+            if model.finished,model.destination == .claude,model.response?.output_directory != nil {
                 HStack { Button("Review transcript") { model.reviewTranscript() }; Button("Show files") { model.revealOutput() } }
-                Text("Claude Code opens in Terminal and waits for your next message.").font(.caption).foregroundStyle(.secondary)
+                Text("Opens the Code composer in Claude Desktop. Review the prompt and send when ready; the conversation appears in its list after the first message.").font(.caption).foregroundStyle(.secondary)
             }
             Divider()
             HStack {
                 Button(model.finished ? "Done" : "Cancel") { model.showPreview=false }.keyboardShortcut(.cancelAction).disabled(model.busy)
                 Spacer()
                 if model.finished {
-                    if model.response?.launch_file != nil { Button("Open Claude Code") { model.openClaudeCode() }.buttonStyle(MonochromePrimaryStyle()) }
+                    if model.destination == .claude,model.response?.output_directory != nil { Button("Open Claude Desktop") { Task { await model.openClaudeDesktop() } }.buttonStyle(MonochromePrimaryStyle()).disabled(model.busy) }
                     else { Button("Open destination") { model.openDestination() }.buttonStyle(MonochromePrimaryStyle()) }
                 } else if model.canExecute {
                     Button(model.source == .claude ? "Import selected sessions" : "Create continuation") { Task { await model.execute() } }.buttonStyle(MonochromePrimaryStyle()).disabled(model.busy).keyboardShortcut(.defaultAction)
@@ -1494,6 +1554,18 @@ private struct ManagerProtocolTests {
             try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: false,
                                                    attributes: [.posixPermissions: 0o700])
             defer { try? FileManager.default.removeItem(at: temporary) }
+            var desktopComponents=URLComponents()
+            desktopComponents.scheme="claude";desktopComponents.host="code";desktopComponents.path="/new"
+            desktopComponents.queryItems=[URLQueryItem(name:"q",value:"Review the saved context before sending."),URLQueryItem(name:"folder",value:temporary.path)]
+            let desktopLink=desktopComponents.url!.absoluteString
+            try check(claudeDesktopComposerURL(desktopLink) != nil)
+            try check(claudeDesktopComposerURL(desktopLink.replacingOccurrences(of:"claude://",with:"https://")) == nil)
+            try check(claudeDesktopComposerURL(desktopLink.replacingOccurrences(of:"code/new",with:"cowork/new")) == nil)
+            try check(claudeDesktopComposerURL(desktopLink+"&folder=duplicate") == nil)
+            try check(claudeDesktopComposerURL(desktopLink+"#fragment") == nil)
+            desktopComponents.queryItems=[URLQueryItem(name:"q",value:String(repeating:"x",count:4097)),URLQueryItem(name:"folder",value:temporary.path)]
+            try check(claudeDesktopComposerURL(desktopComponents.url!.absoluteString) == nil)
+            try check(BridgeEndpoint.claude.destinationTitle == "Claude Desktop · Code")
             let mock = temporary.appendingPathComponent("manager.py")
             try Data("""
                 import json,sys

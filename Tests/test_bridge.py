@@ -16,6 +16,7 @@ import time
 import unittest
 from unittest import mock
 import uuid
+from urllib.parse import parse_qs, urlsplit
 
 import bridge
 
@@ -343,13 +344,32 @@ class BridgeTests(unittest.TestCase):
         with mock.patch.object(bridge, "MAX_TRANSCRIPT", 20), self.assertRaisesRegex(bridge.BridgeError, "nothing was truncated"):
             self.f.prepared("chatgpt")
 
-    def test_missing_cwd_or_cli_prevents_continuation(self):
+    def test_missing_cwd_prevents_continuation_but_cli_is_optional(self):
         self.f.inventory["chatgpt"][CODEX_ID]["cwd"] = str(self.f.directory / "gone")
         with self.assertRaisesRegex(bridge.BridgeError, "project folder"):
             self.f.prepared("chatgpt")
+        self.f.inventory["chatgpt"][CODEX_ID]["cwd"] = str(self.f.project)
         self.f.cli.unlink()
-        with self.assertRaisesRegex(bridge.BridgeError, "CLI is not installed"):
-            self.f.prepared("chatgpt")
+        _, request = self.f.prepared("chatgpt")
+        result = self.f.backend.execute(request)
+        self.assertTrue(result["desktop_url"].startswith("claude://code/new?"))
+        self.assertEqual(result["project_path"], str(self.f.project))
+
+    def test_export_includes_desktop_draft_without_embedded_history_or_auto_send(self):
+        _, request = self.f.prepared("chatgpt")
+        result = self.f.backend.execute(request)
+        parsed = urlsplit(result["desktop_url"])
+        self.assertEqual((parsed.scheme, parsed.netloc, parsed.path), ("claude", "code", "/new"))
+        parameters = parse_qs(parsed.query)
+        self.assertEqual(set(parameters), {"q", "folder"})
+        self.assertEqual(parameters["folder"], [str(self.f.project)])
+        self.assertIn(json.dumps(result["transcript_file"], ensure_ascii=False), parameters["q"][0])
+        self.assertIn("quoted historical data", parameters["q"][0])
+        self.assertIn("review it and press Send", parameters["q"][0])
+        self.assertLessEqual(len(parameters["q"][0]), 4096)
+        self.assertNotIn(CODEX_ID, result["desktop_url"])
+        self.assertNotIn("Visible final answer", result["desktop_url"])
+        self.assertIn("after your first message", result["message"])
 
     def test_redirected_control_folder_is_rejected(self):
         _, request = self.f.prepared("chatgpt")

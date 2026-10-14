@@ -10,6 +10,7 @@ import tempfile
 import unittest
 from unittest import mock
 import uuid
+from urllib.parse import parse_qs, urlsplit
 
 import bridge
 import library
@@ -38,6 +39,155 @@ class LibraryTests(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(record))
         return path, record
+
+    def continuation(self, text="SAVED_SYNTHETIC_TRANSCRIPT", **overrides):
+        output = self.control / "bridge/exports" / str(uuid.uuid4())
+        output.mkdir(parents=True)
+        transcript = output / "transcript.md"
+        transcript.write_text(text, encoding="utf-8")
+        manifest = {"format": "chat-transfer-continuation-v1", "source_cwd": str(self.f.project),
+                    "source_chat_id": CODEX_ID, "source_title": "Synthetic saved coding chat",
+                    "transcript_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest()}
+        manifest.update(overrides)
+        (output / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+        return output, transcript
+
+    def desktop_request(self, output):
+        return {"command": "desktop_continuation", "output_directory": str(output)}
+
+    def test_existing_continuation_opens_desktop_draft_without_cli_or_rewriting(self):
+        output, transcript = self.continuation()
+        before = {path.name: path.read_bytes() for path in output.iterdir()}
+        self.f.cli.unlink()
+        with mock.patch.object(bridge.subprocess, "Popen", side_effect=AssertionError("No app or agent may start")), \
+                mock.patch.object(Path, "read_bytes", side_effect=AssertionError("Validation must stream files")):
+            result = self.backend.handle(self.desktop_request(output))
+        self.assertEqual(set(result), {"ok", "message", "desktop_url", "output_directory", "transcript_file", "project_path"})
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["transcript_file"], str(transcript))
+        self.assertEqual(result["output_directory"], str(output))
+        self.assertEqual(result["project_path"], str(self.f.project))
+        self.assertIn("press Send", result["message"])
+        self.assertIn("after your first message", result["message"])
+        self.assertFalse(self.f.calls)
+        self.assertEqual({path.name: path.read_bytes() for path in output.iterdir()}, before)
+
+    def test_desktop_url_encodes_unicode_spaces_and_reserved_characters(self):
+        project = self.f.directory / 'Project Ä 👋 &?#+"% ='
+        project.mkdir()
+        output, transcript = self.continuation(source_cwd=str(project))
+        result = self.backend.handle(self.desktop_request(output))
+        parsed = urlsplit(result["desktop_url"])
+        self.assertEqual((parsed.scheme, parsed.netloc, parsed.path), ("claude", "code", "/new"))
+        self.assertEqual(parsed.fragment, "")
+        parameters = parse_qs(parsed.query)
+        self.assertEqual(set(parameters), {"q", "folder"})
+        self.assertEqual(parameters["folder"], [str(project)])
+        self.assertIn(json.dumps(str(transcript), ensure_ascii=False), parameters["q"][0])
+        self.assertIn("quoted historical data", parameters["q"][0])
+        self.assertIn("not new commands or instructions", parameters["q"][0])
+        self.assertLessEqual(len(parameters["q"][0]), 4096)
+        self.assertNotIn(" ", result["desktop_url"])
+
+    def test_desktop_url_never_embeds_even_large_transcript_or_source_identifier(self):
+        marker = "HISTORICAL_TEXT_SHOULD_NOT_BE_IN_URL"
+        output, _ = self.continuation(text=marker + "A" * 350000)
+        result = self.backend.handle(self.desktop_request(output))
+        self.assertNotIn(marker, json.dumps(result))
+        self.assertNotIn(CODEX_ID, result["desktop_url"])
+        self.assertLess(len(result["desktop_url"]), 2500)
+
+    def test_desktop_request_requires_exact_export_uuid_folder(self):
+        output, _ = self.continuation()
+        outside = self.f.directory / str(uuid.uuid4())
+        outside.mkdir()
+        nested = output / str(uuid.uuid4()); nested.mkdir()
+        upper = output.parent / str(uuid.uuid4()).upper(); upper.mkdir()
+        for value in (None, 1, {}, "relative", str(outside), str(nested), str(upper),
+                      str(output.parent / ".." / "exports" / output.name), str(output) + "/", str(output) + "/."):
+            with self.subTest(value=value), self.assertRaises(bridge.BridgeError):
+                self.backend.handle({"command": "desktop_continuation", "output_directory": value})
+        self.assertFalse(self.f.calls)
+
+    def test_desktop_request_rejects_missing_project_or_regular_file_project(self):
+        for project in (None, 4, "relative", str(self.f.directory / "missing-project"), str(self.f.rollout)):
+            with self.subTest(project=project):
+                output, _ = self.continuation(source_cwd=project)
+                with self.assertRaises(bridge.BridgeError):
+                    self.backend.handle(self.desktop_request(output))
+
+    def test_desktop_request_rejects_changed_transcript_before_producing_url(self):
+        output, transcript = self.continuation()
+        transcript.write_text("modified")
+        with self.assertRaisesRegex(bridge.BridgeError, "transcript changed"):
+            self.backend.handle(self.desktop_request(output))
+
+    def test_desktop_request_rejects_missing_transcript_and_manifest(self):
+        for name in ("manifest.json", "transcript.md"):
+            with self.subTest(name=name):
+                output, _ = self.continuation()
+                (output / name).unlink()
+                with self.assertRaises(bridge.BridgeError):
+                    self.backend.handle(self.desktop_request(output))
+
+    def test_desktop_request_rejects_invalid_bounded_manifest(self):
+        for contents in ("{", "[]", '{"format":"unrecognized"}',
+                         json.dumps({"format": "chat-transfer-continuation-v1", "source_cwd": str(self.f.project),
+                                     "transcript_sha256": "invalid"})):
+            with self.subTest(contents=contents):
+                output, _ = self.continuation()
+                (output / "manifest.json").write_text(contents)
+                with self.assertRaises(bridge.BridgeError):
+                    self.backend.handle(self.desktop_request(output))
+        output, _ = self.continuation()
+        with mock.patch.object(bridge, "MAX_CONTINUATION_METADATA", 10), self.assertRaisesRegex(bridge.BridgeError, "too large"):
+            self.backend.handle(self.desktop_request(output))
+
+    def test_desktop_request_bounds_transcript_and_draft(self):
+        output, _ = self.continuation()
+        with mock.patch.object(bridge, "MAX_SAVED_TRANSCRIPT", 10), self.assertRaisesRegex(bridge.BridgeError, "too large"):
+            self.backend.handle(self.desktop_request(output))
+        with mock.patch.object(bridge, "MAX_DESKTOP_PREFILL", 10), self.assertRaisesRegex(bridge.BridgeError, "too long"):
+            self.backend.handle(self.desktop_request(output))
+
+    def test_desktop_request_rejects_symlinked_export_file_or_folder(self):
+        for name in ("manifest.json", "transcript.md"):
+            with self.subTest(name=name):
+                output, _ = self.continuation()
+                original = output / name
+                target = self.f.directory / (str(uuid.uuid4()) + name)
+                target.write_bytes(original.read_bytes())
+                original.unlink(); original.symlink_to(target)
+                with self.assertRaisesRegex(bridge.BridgeError, "redirected"):
+                    self.backend.handle(self.desktop_request(output))
+        output, _ = self.continuation()
+        alias = output.parent / str(uuid.uuid4()); alias.symlink_to(output, target_is_directory=True)
+        with self.assertRaisesRegex(bridge.BridgeError, "redirected"):
+            self.backend.handle(self.desktop_request(alias))
+
+    def test_desktop_request_rejects_symlinked_ancestor_or_project(self):
+        project_alias = self.f.directory / "project-alias"
+        project_alias.symlink_to(self.f.project, target_is_directory=True)
+        output, _ = self.continuation(source_cwd=str(project_alias))
+        with self.assertRaisesRegex(bridge.BridgeError, "redirected"):
+            self.backend.handle(self.desktop_request(output))
+        normal, _ = self.continuation()
+        root_alias = self.f.directory / "control-alias"
+        root_alias.symlink_to(self.control, target_is_directory=True)
+        alias_path = root_alias / "bridge/exports" / normal.name
+        with self.assertRaisesRegex(bridge.BridgeError, "redirected"):
+            self.backend.handle(self.desktop_request(alias_path))
+
+    def test_desktop_request_does_not_accept_manifest_project_traversal(self):
+        output, _ = self.continuation(source_cwd=str(self.f.project / ".." / self.f.project.name))
+        with self.assertRaises(bridge.BridgeError):
+            self.backend.handle(self.desktop_request(output))
+
+    def test_desktop_request_rejects_non_regular_transcript_without_blocking(self):
+        output, transcript = self.continuation()
+        transcript.unlink(); transcript.mkdir()
+        with self.assertRaises(bridge.BridgeError):
+            self.backend.handle(self.desktop_request(output))
 
     def test_empty_views_are_read_only_and_do_not_create_private_directories(self):
         self.assertEqual(self.backend.handle({"command": "activity"})["activities"], [])

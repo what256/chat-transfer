@@ -24,7 +24,7 @@ does not contain either vendor's application or CLI binaries.
 | --- | --- | --- |
 | Codex profile → Codex profile | Copy, Move, Sync | Selected saved history and required recorded fork/subagent dependencies |
 | Claude Code → Codex profile | Native import | Selected local Claude Code sessions, through the installed Codex CLI's native importer |
-| Codex profile → Claude Code | Continuation | A private transcript of saved visible user/assistant text, plus a launcher for a fresh interactive Claude Code session |
+| Codex profile → Claude Desktop Code | Continuation | A private transcript of saved visible user/assistant text and a prefilled Desktop Code composer |
 
 **Copy** keeps the source available. Replacing different destination work requires
 explicit consent in the review, and the previous state is backed up. **Move**
@@ -34,8 +34,18 @@ refuses divergent changes rather than choosing a version silently.
 
 A Claude continuation is reference context for a new session. It does not recreate
 the original message timeline, tool execution, attachments, hidden reasoning,
-approvals, or filesystem checkpoints. Preparing it sends no model prompt. The
-launcher waits for your next message. Cross-provider Move and Sync are not offered.
+approvals, or filesystem checkpoints. **Open Claude Desktop** opens its Code
+composer with a short prompt referencing the complete local transcript. Confirm
+the project folder, review or edit the draft, and press Send when ready. The
+conversation appears in Desktop's saved list after that first message; preparing
+context alone does not create it. No prompt is sent automatically. Cross-provider
+Move and Sync are not offered.
+
+Existing continuation packages can be reopened from **Activity → Open Claude
+Desktop**. The app verifies the saved transcript before opening it. Its supported
+[Desktop Code link](https://support.claude.com/en/articles/14729294-open-claude-desktop-with-a-link)
+contains a local file reference, rather than embedding or truncating the transcript.
+The older terminal launcher remains an optional saved artifact.
 
 Cloud ChatGPT and Claude conversations are outside this app's local coding-chat
 library. Chats with attached resources, goals, memberships, or incomplete history
@@ -52,8 +62,9 @@ termination of active work.
 - For native Claude imports and Codex continuations, a user-installed Codex CLI in
   the configured ChatGPT application location. It is a separate vendor dependency
   and is not redistributed here.
-- For opening a Claude continuation, the user-installed Claude Code CLI at
-  `~/.local/bin/claude`.
+- For opening a continuation in Desktop, Claude Desktop at `/Applications/Claude.app`
+  or `~/Applications/Claude.app`, signed in with Code available. The optional legacy
+  terminal launcher uses the user's Claude Code CLI at `~/.local/bin/claude`.
 
 The current profile registry has fixed defaults:
 
